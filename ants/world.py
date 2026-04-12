@@ -56,18 +56,23 @@ class Viewport:
         screen_width: int,
         screen_height: int,
         margin: int = 24,
+        content_rect: tuple[int, int, int, int] | None = None,
     ) -> None:
         self.world = world
         self.screen_width = screen_width
         self.screen_height = screen_height
         self.margin = margin
-        inner_w = screen_width - 2 * margin
-        inner_h = screen_height - 2 * margin
+        if content_rect is None:
+            cx, cy, cw, ch = 0, 0, screen_width, screen_height
+        else:
+            cx, cy, cw, ch = content_rect
+        inner_w = max(1, cw - 2 * margin)
+        inner_h = max(1, ch - 2 * margin)
         self.scale = min(inner_w / world.width, inner_h / world.height)
         w_px = world.width * self.scale
         h_px = world.height * self.scale
-        self.offset_x = margin + (inner_w - w_px) / 2.0
-        self.offset_y = margin + (inner_h - h_px) / 2.0
+        self.offset_x = cx + margin
+        self.offset_y = cy + margin + (inner_h - h_px) / 2.0
 
     def world_to_screen(self, wx: float, wy: float) -> tuple[int, int]:
         sx = int(self.offset_x + wx * self.scale)
