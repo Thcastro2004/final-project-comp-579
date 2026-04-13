@@ -1,0 +1,44 @@
+---
+description: Where to add or change code in the COMP 579 ant colony project (do not bloat main.py)
+alwaysApply: true
+---
+
+# Ant colony project layout
+
+## Hard rule
+
+- **`main.py` is entrypoint only**: `argparse`, import `run_window` / `run_headless`, and `main()`. Do **not** add game logic, pygame UI, persistence, or constants here.
+
+## Where to put changes
+
+| Concern | Location |
+|---------|----------|
+| World geometry, `Viewport`, `World` | `ants/world.py` |
+| Tunables, paths, `WINDOW_*`, `WORLD_*`, colors as constants | `ants/config.py` |
+| `ColonyBlueprint`, `SimColony`, blueprint defaults, `_norm_reward` | `ants/models.py` |
+| Terrain CMP1 binary, load paths, blit into surface | `ants/persistence/terrain.py` |
+| `session.json` read/write, version fields | `ants/persistence/session.py` |
+| Generic PNG/PIL helpers (no tint cache) | `ants/assets.py` |
+| UI font setup (freetype) | `ants/fonts.py` |
+| Headless / batch entry | `ants/headless.py` |
+| pygame init, main loop order, `RuntimeBundle` assembly | `ants/app.py` |
+| `UiTheme`, `PanelLayout`, `GameState`, `RuntimeBundle` fields | `ants/ui/state.py` |
+| Merging saved session into `GameState` | `ants/ui/session_merge.py` |
+| Rect geometry for panels and modals | `ants/ui/layout.py` |
+| Food/colony sprite load and `ColonyTintCache` | `ants/ui/sprites.py` |
+| Brush, tunnel sampling, terrain save + session snapshot | `ants/ui/map_tools.py` |
+| Scroll, colony color swap, `food_spawn_burst`, etc. | `ants/ui/helpers.py` |
+| Buttons, fields, combo heads, trash icon | `ants/ui/drawWidgets.py` |
+| Map view (terrain, food, nests, edit previews) | `ants/ui/drawMap.py` |
+| Right panel + colony cards list | `ants/ui/drawPanel.py` |
+| Dropdown overlay, scrollbar, add/new-blueprint modals | `ants/ui/drawModals.py` |
+| All `pygame.event` handling | `ants/ui/input.py` |
+
+## State
+
+- Prefer new mutable UI/sim state on **`GameState`** (in `ants/ui/state.py`) or layout constants on **`PanelLayout`**, not new globals.
+
+## Imports
+
+- Keep **`ants/world.py`** free of pygame.
+- Do **not** import `ants.ui` from `ants/persistence/*`.
