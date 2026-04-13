@@ -8,3 +8,13 @@ __pycache__/
 .eggs/
 dist/
 build/
+save/terrain.bin
+save/terrain.tmp.bin
+save/session.json
+save/session.tmp.json
+save/terrain_map.bmp
+save/terrain_map.tmp.bmp
+save/terrain_map.png
+save/terrain_map.tmp.png
+terrain_map.png
+terrain_map.tmp.png

@@ -1,8 +1,14 @@
 import argparse
+import io
+import json
+import math
+import os
+import struct
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
-from ants.world import Food, Nest, Viewport, World
+from ants.world import Viewport, World
 
 # World size in abstract units (shown as a letterboxed rectangle on screen).
 WORLD_WIDTH = 2800.0
@@ -14,6 +20,98 @@ PANEL_MARGIN = 10
 CARD_GAP = 8
 CARD_HEIGHT = 148
 REWARD_SYSTEMS = ("individualist", "cooperative", "safe", "explorer")
+
+TERRAIN_WALL = (78, 60, 51)  # #4e3c33
+TERRAIN_TUNNEL = (133, 102, 88)  # #856658
+BORDER_LOCK = 10
+BRUSH_RADIUS_PRESETS = (12, 20, 32, 48, 72, 96)
+BRUSH_PRESET_ROW_H = 42
+BRUSH_PRESET_GAP = 6
+BRUSH_PRESET_MAX = max(BRUSH_RADIUS_PRESETS)
+BRUSH_PREVIEW_WHITE = (255, 255, 255)
+_SAVE_DIR = Path(__file__).resolve().parent / "save"
+# Raw RGB grid: magic "CMP1", uint32 LE width, uint32 LE height, then w*h*3 bytes row-major RGB.
+TERRAIN_BIN_MAGIC = b"CMP1"
+_TERRAIN_HEADER = struct.Struct("<4sII")
+TERRAIN_SAVE_FILE = _SAVE_DIR / "terrain.bin"
+_LEGACY_TERRAIN_FILE = Path(__file__).resolve().parent / "terrain_map.png"
+SESSION_SAVE_FILE = _SAVE_DIR / "session.json"
+SESSION_VERSION = 1
+
+
+def _terrain_tmp_path(path: Path) -> Path:
+    return path.parent / f"{path.stem}.tmp{path.suffix}"
+
+
+def _terrain_candidate_paths() -> tuple[Path, ...]:
+    return (
+        TERRAIN_SAVE_FILE,
+        _SAVE_DIR / "terrain_map.bmp",
+        _SAVE_DIR / "terrain_map.png",
+        _LEGACY_TERRAIN_FILE,
+    )
+
+
+def _terrain_pack_rgb(surf: object, pygame_mod: object) -> tuple[int, int, bytes]:
+    w, h = surf.get_size()
+    try:
+        raw = pygame_mod.image.tobytes(surf, "RGB")
+    except (pygame_mod.error, TypeError, ValueError):
+        c = pygame_mod.Surface((w, h), depth=24)
+        c.blit(surf, (0, 0))
+        raw = pygame_mod.image.tobytes(c, "RGB")
+    need = w * h * 3
+    if len(raw) != need:
+        raise ValueError("terrain rgb size mismatch")
+    return w, h, raw
+
+
+def _terrain_save_bin(path: Path, surf: object, pygame_mod: object) -> None:
+    w, h, raw = _terrain_pack_rgb(surf, pygame_mod)
+    tmp = _terrain_tmp_path(path)
+    blob = _TERRAIN_HEADER.pack(TERRAIN_BIN_MAGIC, w, h) + raw
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_bytes(blob)
+    os.replace(str(tmp), str(path))
+
+
+def _terrain_decode_bin(data: bytes, pygame_mod: object) -> tuple[int, int, object] | None:
+    if len(data) < _TERRAIN_HEADER.size:
+        return None
+    magic, w, h = _TERRAIN_HEADER.unpack_from(data, 0)
+    if magic != TERRAIN_BIN_MAGIC:
+        return None
+    need = _TERRAIN_HEADER.size + w * h * 3
+    if len(data) != need:
+        return None
+    raw = bytes(data[_TERRAIN_HEADER.size :])
+    img = pygame_mod.image.frombuffer(raw, (w, h), "RGB")
+    return w, h, img.convert()
+
+
+def _terrain_blit_file_into(path: Path, pygame_mod: object, dest: object, map_rw: int, map_rh: int) -> bool:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    tri = _terrain_decode_bin(data, pygame_mod)
+    if tri is not None:
+        lw, lh, loaded = tri
+        if (lw, lh) == (map_rw, map_rh):
+            dest.blit(loaded, (0, 0))
+        elif lw > 0 and lh > 0:
+            dest.blit(pygame_mod.transform.smoothscale(loaded, (map_rw, map_rh)), (0, 0))
+        return True
+    try:
+        loaded = pygame_mod.image.load(io.BytesIO(data)).convert()
+    except (pygame_mod.error, OSError, TypeError, ValueError):
+        return False
+    lw, lh = loaded.get_size()
+    if (lw, lh) == (map_rw, map_rh):
+        dest.blit(loaded, (0, 0))
+    elif lw > 0 and lh > 0:
+        dest.blit(pygame_mod.transform.smoothscale(loaded, (map_rw, map_rh)), (0, 0))
+    return True
 
 
 @dataclass
@@ -36,6 +134,74 @@ def default_colonies() -> list[ColonyRow]:
         ColonyRow.preset("Safe", "safe"),
         ColonyRow.preset("Explorer", "explorer"),
     ]
+
+
+def _session_row_to_dict(row: ColonyRow) -> dict:
+    return {
+        "name": row.name,
+        "soldiers_str": row.soldiers_str,
+        "fetchers_str": row.fetchers_str,
+        "respawn_str": row.respawn_str,
+        "reward": row.reward,
+    }
+
+
+def _session_row_from_dict(o: object) -> ColonyRow | None:
+    if not isinstance(o, dict):
+        return None
+    name = o.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    rw = o.get("reward", "individualist")
+    if rw not in REWARD_SYSTEMS:
+        rw = "individualist"
+    return ColonyRow(
+        name=name,
+        soldiers_str=str(o.get("soldiers_str", "3")),
+        fetchers_str=str(o.get("fetchers_str", "5")),
+        respawn_str=str(o.get("respawn_str", "1.0")),
+        reward=rw,
+    )
+
+
+def _session_read() -> dict | None:
+    if not SESSION_SAVE_FILE.is_file():
+        return None
+    try:
+        d = json.loads(SESSION_SAVE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError, TypeError):
+        return None
+    if not isinstance(d, dict) or d.get("version") != SESSION_VERSION:
+        return None
+    return d
+
+
+def _session_write(
+    colonies: list[ColonyRow],
+    next_custom_id: int,
+    colony_scroll: int,
+    brush_radius_index: int,
+    sim_running: bool,
+) -> None:
+    tmp = SESSION_SAVE_FILE.with_suffix(".tmp.json")
+    payload = {
+        "version": SESSION_VERSION,
+        "colonies": [_session_row_to_dict(c) for c in colonies],
+        "next_custom_id": next_custom_id,
+        "colony_scroll": colony_scroll,
+        "brush_radius_index": brush_radius_index,
+        "sim_running": sim_running,
+    }
+    try:
+        _SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(str(tmp), str(SESSION_SAVE_FILE))
+    except (OSError, TypeError, ValueError):
+        try:
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _make_ui_fonts() -> tuple[object, object, object]:
@@ -67,12 +233,8 @@ def _make_ui_fonts() -> tuple[object, object, object]:
 
 def run_headless() -> int:
     world = World(WORLD_WIDTH, WORLD_HEIGHT)
-    food = Food(x=520.0, y=180.0, remaining=100.0, pickup_radius=36.0)
-    nest = Nest(x=140.0, y=420.0, radius=42.0)
     print("Headless mode: no display (batch / RL later).")
     print(f"World: {world.width} x {world.height}")
-    print(f"Food: ({food.x}, {food.y}) remaining={food.remaining} r={food.pickup_radius}")
-    print(f"Nest: ({nest.x}, {nest.y}) r={nest.radius}")
     return 0
 
 
@@ -88,20 +250,60 @@ def run_window() -> int:
         margin=20,
         content_rect=(0, 0, world_w, WINDOW_HEIGHT),
     )
-    food = Food(x=520.0, y=180.0, remaining=100.0, pickup_radius=36.0)
-    nest = Nest(x=140.0, y=420.0, radius=42.0)
-
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
     pygame.display.set_caption("Ant colony sim")
     clock = pygame.time.Clock()
     font, font_small, font_title = _make_ui_fonts()
 
+    map_rx, map_ry, map_rw, map_rh = viewport.world_rect_screen()
+    terrain_surf = pygame.Surface((map_rw, map_rh))
+    terrain_surf.fill(TERRAIN_WALL)
+
+    for _tp in _terrain_candidate_paths():
+        if _tp.is_file() and _terrain_blit_file_into(_tp, pygame, terrain_surf, map_rw, map_rh):
+            break
+
+    _ed_w = max(0, map_rw - 2 * BORDER_LOCK)
+    _ed_h = max(0, map_rh - 2 * BORDER_LOCK)
+    editable_inner = pygame.Rect(BORDER_LOCK, BORDER_LOCK, _ed_w, _ed_h)
+
+    def _in_editable(lx: float, ly: float) -> bool:
+        return (
+            editable_inner.left <= lx < editable_inner.right
+            and editable_inner.top <= ly < editable_inner.bottom
+        )
+
+    def stamp_brush(lx: float, ly: float, radius: int, color: tuple[int, int, int]) -> None:
+        if radius < 1 or not _in_editable(lx, ly):
+            return
+        old = terrain_surf.get_clip()
+        terrain_surf.set_clip(editable_inner)
+        pygame.draw.circle(terrain_surf, color, (int(lx), int(ly)), int(radius))
+        terrain_surf.set_clip(old)
+
+    def paint_brush_line(
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        radius: int,
+        color: tuple[int, int, int],
+        *,
+        step_frac: float = 0.5,
+    ) -> None:
+        dx, dy = x1 - x0, y1 - y0
+        dist = math.hypot(dx, dy)
+        if dist < 0.5:
+            stamp_brush(x1, y1, radius, color)
+            return
+        step = max(1.0, radius * step_frac)
+        n = max(1, int(math.ceil(dist / step)))
+        for i in range(n + 1):
+            t = i / n
+            stamp_brush(x0 + dx * t, y0 + dy * t, radius, color)
+
     border_color = (120, 140, 160)
-    nest_fill = (55, 48, 40)
-    nest_outline = (110, 92, 72)
-    food_fill = (72, 160, 90)
-    food_outline = (120, 210, 130)
     panel_bg = (24, 28, 38)
     panel_border = (55, 62, 78)
     card_bg = (34, 38, 50)
@@ -117,6 +319,12 @@ def run_window() -> int:
     colonies: list[ColonyRow] = default_colonies()
     sim_running = False
     edit_map = False
+    brush_tool_active = True
+    brush_dropdown_open = False
+    brush_radius_index = 2
+    brush_radius_px = BRUSH_RADIUS_PRESETS[brush_radius_index]
+    last_stroke_left: tuple[float, float] | None = None
+    last_stroke_right: tuple[float, float] | None = None
     colony_scroll = 0
     next_custom_id = 1
     # (colony_index, "soldiers"|"fetchers"|"respawn") | None
@@ -126,6 +334,8 @@ def run_window() -> int:
     btn_h = 32
     row1_y = 44
     row2_y = row1_y + btn_h + 8
+    edit_done_y = 46
+    edit_brush_y = edit_done_y + btn_h + 12
     col_label_y = row2_y + btn_h + 12
     add_btn_h = 30
     add_y = col_label_y + 22
@@ -179,26 +389,183 @@ def run_window() -> int:
         max_scroll = max(0, colonies_content_height() - scroll_rect.height)
         colony_scroll = min(max(0, colony_scroll), max_scroll)
 
+    sd = _session_read()
+    if sd is not None:
+        raw_cols = sd.get("colonies")
+        if isinstance(raw_cols, list) and raw_cols:
+            parsed: list[ColonyRow] = []
+            for item in raw_cols:
+                row = _session_row_from_dict(item)
+                if row is not None:
+                    parsed.append(row)
+            if parsed:
+                colonies = parsed
+        if "next_custom_id" in sd:
+            try:
+                next_custom_id = max(1, int(sd["next_custom_id"]))
+            except (TypeError, ValueError):
+                pass
+        if "colony_scroll" in sd:
+            try:
+                colony_scroll = int(sd["colony_scroll"])
+            except (TypeError, ValueError):
+                pass
+        if "brush_radius_index" in sd:
+            try:
+                bi = int(sd["brush_radius_index"])
+                if 0 <= bi < len(BRUSH_RADIUS_PRESETS):
+                    brush_radius_index = bi
+                    brush_radius_px = BRUSH_RADIUS_PRESETS[bi]
+            except (TypeError, ValueError):
+                pass
+        if "sim_running" in sd:
+            sim_running = bool(sd["sim_running"])
+    clamp_scroll()
+
+    def save_terrain() -> None:
+        tmp = _terrain_tmp_path(TERRAIN_SAVE_FILE)
+        try:
+            _terrain_save_bin(TERRAIN_SAVE_FILE, terrain_surf, pygame)
+        except (pygame.error, OSError, TypeError, ValueError):
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+        _session_write(
+            colonies,
+            next_custom_id,
+            colony_scroll,
+            brush_radius_index,
+            sim_running,
+        )
+
+    def edit_layout() -> tuple[pygame.Rect, pygame.Rect, pygame.Rect, list[pygame.Rect]]:
+        done_r = pygame.Rect(PANEL_MARGIN, edit_done_y, PANEL_WIDTH - 2 * PANEL_MARGIN, btn_h)
+        half_w = (PANEL_WIDTH - 3 * PANEL_MARGIN) // 2
+        brush_tool_r = pygame.Rect(PANEL_MARGIN, edit_brush_y, half_w, btn_h)
+        drop_head_r = pygame.Rect(brush_tool_r.right + PANEL_MARGIN, edit_brush_y, half_w, btn_h)
+        opt_rects: list[pygame.Rect] = []
+        if brush_dropdown_open:
+            n = len(BRUSH_RADIUS_PRESETS)
+            inner_w = PANEL_WIDTH - 2 * PANEL_MARGIN
+            cell_w = max(1, (inner_w - BRUSH_PRESET_GAP * (n - 1)) // n)
+            top = drop_head_r.bottom + 4
+            for i in range(n):
+                x = PANEL_MARGIN + i * (cell_w + BRUSH_PRESET_GAP)
+                opt_rects.append(pygame.Rect(x, top, cell_w, BRUSH_PRESET_ROW_H - 2))
+        return done_r, brush_tool_r, drop_head_r, opt_rects
+
+    def preset_circle_radius(preset_r: int, cell_w: int, cell_h: int) -> int:
+        cap = min(cell_w, cell_h) // 2 - 3
+        cap = max(3, cap)
+        return max(2, min(cap, int(round(preset_r * cap / BRUSH_PRESET_MAX))))
+
+    map_screen_rect = pygame.Rect(map_rx, map_ry, map_rw, map_rh)
+
     running = True
     mouse_xy = (0, 0)
     while running:
         mx, my = mouse_xy
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                save_terrain()
                 running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                save_terrain()
                 running = False
             elif event.type == pygame.MOUSEMOTION:
                 mouse_xy = event.pos
+                ex, ey = event.pos
+                pressed = pygame.mouse.get_pressed(3)
+                if (
+                    edit_map
+                    and brush_tool_active
+                    and ex < panel_x
+                    and map_screen_rect.collidepoint(ex, ey)
+                ):
+                    lx_f = ex - map_rx
+                    ly_f = ey - map_ry
+                    if _in_editable(lx_f, ly_f):
+                        if pressed[0] and last_stroke_left is not None:
+                            ox, oy = last_stroke_left
+                            paint_brush_line(
+                                ox,
+                                oy,
+                                lx_f,
+                                ly_f,
+                                brush_radius_px,
+                                TERRAIN_TUNNEL,
+                                step_frac=0.5,
+                            )
+                            last_stroke_left = (lx_f, ly_f)
+                        if pressed[2] and last_stroke_right is not None:
+                            ox, oy = last_stroke_right
+                            paint_brush_line(
+                                ox,
+                                oy,
+                                lx_f,
+                                ly_f,
+                                brush_radius_px,
+                                TERRAIN_WALL,
+                                step_frac=0.5,
+                            )
+                            last_stroke_right = (lx_f, ly_f)
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    last_stroke_left = None
+                elif event.button == 3:
+                    last_stroke_right = None
             elif event.type == pygame.MOUSEWHEEL:
-                if scroll_rect.collidepoint(mx, my):
+                if not edit_map and scroll_rect.collidepoint(mx, my):
                     colony_scroll -= event.y * 28
                     clamp_scroll()
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                focused_field = None
+            elif event.type == pygame.MOUSEBUTTONDOWN:
                 px, py = event.pos
-                # panel-local coords for hit tests in panel
+                plx, ply = px - panel_x, py
+
                 if px < panel_x:
+                    focused_field = None
+                    if edit_map and map_screen_rect.collidepoint(px, py):
+                        brush_dropdown_open = False
+                        if brush_tool_active and event.button in (1, 3):
+                            lx_f = px - map_rx
+                            ly_f = py - map_ry
+                            if _in_editable(lx_f, ly_f):
+                                if event.button == 1:
+                                    stamp_brush(lx_f, ly_f, brush_radius_px, TERRAIN_TUNNEL)
+                                    last_stroke_left = (lx_f, ly_f)
+                                else:
+                                    stamp_brush(lx_f, ly_f, brush_radius_px, TERRAIN_WALL)
+                                    last_stroke_right = (lx_f, ly_f)
+                    continue
+
+                focused_field = None
+                if edit_map:
+                    done_r, brush_tool_r, drop_head_r, opt_rects = edit_layout()
+                    if event.button == 1:
+                        if done_r.collidepoint(plx, ply):
+                            edit_map = False
+                            brush_dropdown_open = False
+                            save_terrain()
+                        elif brush_tool_r.collidepoint(plx, ply):
+                            brush_tool_active = not brush_tool_active
+                        elif drop_head_r.collidepoint(plx, ply):
+                            brush_dropdown_open = not brush_dropdown_open
+                        elif brush_dropdown_open:
+                            picked = False
+                            for i, orr in enumerate(opt_rects):
+                                if orr.collidepoint(plx, ply):
+                                    brush_radius_index = i
+                                    brush_radius_px = BRUSH_RADIUS_PRESETS[i]
+                                    brush_dropdown_open = False
+                                    picked = True
+                                    break
+                            if not picked:
+                                brush_dropdown_open = False
+                    continue
+
+                if event.button != 1:
                     continue
 
                 row1 = pygame.Rect(
@@ -218,7 +585,7 @@ def run_window() -> int:
                 elif abs_row1b.collidepoint(px, py):
                     sim_running = False
                 elif abs_edit.collidepoint(px, py):
-                    edit_map = not edit_map
+                    edit_map = True
                 else:
                     add_rect = pygame.Rect(
                         panel_x + PANEL_MARGIN,
@@ -236,7 +603,6 @@ def run_window() -> int:
                         next_custom_id += 1
                         clamp_scroll()
                     elif scroll_rect.collidepoint(px, py):
-                        # card hit tests (scroll offset)
                         rel_y = py - scroll_rect.y + colony_scroll
                         idx = int(rel_y // (CARD_HEIGHT + CARD_GAP))
                         if 0 <= idx < len(colonies):
@@ -299,88 +665,127 @@ def run_window() -> int:
                     c.respawn_str = buf
 
         screen.fill((20, 24, 32))
-        rx, ry, rw, rh = viewport.world_rect_screen()
+        rx, ry, rw, rh = map_rx, map_ry, map_rw, map_rh
+        screen.blit(terrain_surf, (rx, ry))
         pygame.draw.rect(screen, border_color, (rx, ry, rw, rh), width=2)
-        nx, ny = viewport.world_to_screen(nest.x, nest.y)
-        nr = viewport.world_dist_to_screen(nest.radius)
-        pygame.draw.circle(screen, nest_fill, (nx, ny), nr)
-        pygame.draw.circle(screen, nest_outline, (nx, ny), nr, width=2)
-        fx, fy = viewport.world_to_screen(food.x, food.y)
-        fr = viewport.world_dist_to_screen(food.pickup_radius)
-        pygame.draw.circle(screen, food_fill, (fx, fy), fr)
-        pygame.draw.circle(screen, food_outline, (fx, fy), fr, width=2)
 
-        if not sim_running:
+        if not sim_running and not edit_map:
             overlay = pygame.Surface((rw, rh), pygame.SRCALPHA)
             overlay.fill((10, 12, 18, 120))
             screen.blit(overlay, (rx, ry))
             paused_txt = font_title.render("Paused", True, text_color)
             screen.blit(paused_txt, paused_txt.get_rect(center=(rx + rw // 2, ry + rh // 2)))
 
+        if edit_map and brush_tool_active and map_screen_rect.collidepoint(mx, my):
+            pygame.draw.circle(screen, BRUSH_PREVIEW_WHITE, (mx, my), brush_radius_px, width=2)
+
         pygame.draw.line(screen, panel_border, (panel_x, 0), (panel_x, WINDOW_HEIGHT), width=1)
         panel_surf = screen.subsurface(pygame.Rect(panel_x, 0, PANEL_WIDTH, WINDOW_HEIGHT))
         panel_surf.fill(panel_bg)
+        plx, ply = mx - panel_x, my
 
-        title = font_title.render("Simulation", True, text_color)
-        panel_surf.blit(title, (PANEL_MARGIN, 12))
+        if edit_map:
+            title = font_title.render("Edit map", True, text_color)
+            panel_surf.blit(title, (PANEL_MARGIN, 12))
+            done_r, brush_tool_r, drop_head_r, opt_rects = edit_layout()
+            draw_button(panel_surf, done_r, "Done", done_r.collidepoint(plx, ply), False)
+            draw_button(
+                panel_surf,
+                brush_tool_r,
+                "Brush",
+                brush_tool_r.collidepoint(plx, ply),
+                brush_tool_active,
+            )
+            pygame.draw.rect(panel_surf, field_bg, drop_head_r, border_radius=6)
+            pygame.draw.rect(
+                panel_surf,
+                panel_border,
+                drop_head_r,
+                width=2 if brush_dropdown_open else 1,
+                border_radius=6,
+            )
+            head_dr = preset_circle_radius(brush_radius_px, drop_head_r.w - 28, drop_head_r.h)
+            head_cx = drop_head_r.left + 12 + head_dr
+            head_cy = drop_head_r.centery
+            pygame.draw.circle(panel_surf, text_color, (head_cx, head_cy), head_dr)
+            cx = drop_head_r.right - 14
+            cy = drop_head_r.centery
+            s = 5
+            if brush_dropdown_open:
+                tri = [(cx - s, cy + s // 2), (cx + s, cy + s // 2), (cx, cy - s // 2)]
+            else:
+                tri = [(cx - s, cy - s // 2), (cx + s, cy - s // 2), (cx, cy + s // 2)]
+            pygame.draw.polygon(panel_surf, muted, tri)
+            if brush_dropdown_open:
+                for i, orr in enumerate(opt_rects):
+                    pr = BRUSH_RADIUS_PRESETS[i]
+                    pygame.draw.rect(panel_surf, card_bg, orr, border_radius=4)
+                    bcol = btn_active if i == brush_radius_index else card_border
+                    pygame.draw.rect(panel_surf, bcol, orr, width=2 if i == brush_radius_index else 1, border_radius=4)
+                    show_r = preset_circle_radius(pr, orr.w, orr.h)
+                    pygame.draw.circle(panel_surf, text_color, orr.center, show_r)
+        else:
+            title = font_title.render("Simulation", True, text_color)
+            panel_surf.blit(title, (PANEL_MARGIN, 12))
 
-        row1 = pygame.Rect(
-            PANEL_MARGIN,
-            row1_y,
-            (PANEL_WIDTH - 3 * PANEL_MARGIN) // 2,
-            btn_h,
-        )
-        row1b = pygame.Rect(row1.right + PANEL_MARGIN, row1_y, row1.width, btn_h)
-        draw_button(panel_surf, row1, "Start", row1.collidepoint(mx - panel_x, my), False)
-        draw_button(panel_surf, row1b, "Pause", row1b.collidepoint(mx - panel_x, my), False)
-        edit_r = pygame.Rect(PANEL_MARGIN, row2_y, PANEL_WIDTH - 2 * PANEL_MARGIN, btn_h)
-        draw_button(panel_surf, edit_r, "Edit map", edit_r.collidepoint(mx - panel_x, my), edit_map)
+            row1 = pygame.Rect(
+                PANEL_MARGIN,
+                row1_y,
+                (PANEL_WIDTH - 3 * PANEL_MARGIN) // 2,
+                btn_h,
+            )
+            row1b = pygame.Rect(row1.right + PANEL_MARGIN, row1_y, row1.width, btn_h)
+            draw_button(panel_surf, row1, "Start", row1.collidepoint(plx, ply), False)
+            draw_button(panel_surf, row1b, "Pause", row1b.collidepoint(plx, ply), False)
+            edit_r = pygame.Rect(PANEL_MARGIN, row2_y, PANEL_WIDTH - 2 * PANEL_MARGIN, btn_h)
+            draw_button(panel_surf, edit_r, "Edit map", edit_r.collidepoint(plx, ply), False)
 
-        cl = font.render("Colonies", True, text_color)
-        panel_surf.blit(cl, (PANEL_MARGIN, col_label_y))
-        add_rect = pygame.Rect(PANEL_MARGIN, add_y, PANEL_WIDTH - 2 * PANEL_MARGIN, add_btn_h)
-        draw_button(panel_surf, add_rect, "+ Add colony", add_rect.collidepoint(mx - panel_x, my), False)
+            cl = font.render("Colonies", True, text_color)
+            panel_surf.blit(cl, (PANEL_MARGIN, col_label_y))
+            add_rect = pygame.Rect(PANEL_MARGIN, add_y, PANEL_WIDTH - 2 * PANEL_MARGIN, add_btn_h)
+            draw_button(panel_surf, add_rect, "+ Add colony", add_rect.collidepoint(plx, ply), False)
 
         old_clip = screen.get_clip()
         screen.set_clip(scroll_rect)
         content_h = colonies_content_height()
-        for i, col in enumerate(colonies):
-            card_top = scroll_rect.y + i * (CARD_HEIGHT + CARD_GAP) - colony_scroll
-            card_rect = pygame.Rect(scroll_rect.x + 2, card_top, scroll_rect.width - 4, CARD_HEIGHT)
-            if card_rect.bottom < scroll_rect.top or card_rect.top > scroll_rect.bottom:
-                continue
-            pygame.draw.rect(screen, card_bg, card_rect, border_radius=8)
-            pygame.draw.rect(screen, card_border, card_rect, width=1, border_radius=8)
-            name_s = font.render(col.name, True, text_color)
-            screen.blit(name_s, (card_rect.x + 10, card_rect.y + 8))
-            inner = pygame.Rect(card_rect.x + 8, card_rect.y + 30, card_rect.w - 16, CARD_HEIGHT - 38)
-            third = (inner.w - 16) // 3
-            f_s = pygame.Rect(inner.x, inner.y + 18, third, 26)
-            f_f = pygame.Rect(f_s.right + 8, inner.y + 18, third, 26)
-            f_r = pygame.Rect(f_f.right + 8, inner.y + 18, third, 26)
-            fs = focused_field == (i, "soldiers")
-            ff = focused_field == (i, "fetchers")
-            frf = focused_field == (i, "respawn")
-            draw_text_field(screen, f_s, col.soldiers_str, "Soldiers", fs)
-            draw_text_field(screen, f_f, col.fetchers_str, "Fetchers", ff)
-            draw_text_field(screen, f_r, col.respawn_str, "Respawn", frf)
-            rew_y = inner.y + 18 + 26 + 10
-            rew_prev = pygame.Rect(inner.x, rew_y, 28, 24)
-            rew_next = pygame.Rect(inner.right - 28, rew_y, 28, 24)
-            draw_button(screen, rew_prev, "<", rew_prev.collidepoint(mx, my), False)
-            draw_button(screen, rew_next, ">", rew_next.collidepoint(mx, my), False)
-            rw_txt = font_small.render(col.reward, True, muted)
-            rw_rect = rw_txt.get_rect(center=((rew_prev.right + rew_next.left) // 2, rew_y + 12))
-            screen.blit(rw_txt, rw_rect)
-            lab = font_small.render("Reward", True, muted)
-            screen.blit(lab, (inner.x, rew_y - 14))
+        if not edit_map:
+            for i, col in enumerate(colonies):
+                card_top = scroll_rect.y + i * (CARD_HEIGHT + CARD_GAP) - colony_scroll
+                card_rect = pygame.Rect(scroll_rect.x + 2, card_top, scroll_rect.width - 4, CARD_HEIGHT)
+                if card_rect.bottom < scroll_rect.top or card_rect.top > scroll_rect.bottom:
+                    continue
+                pygame.draw.rect(screen, card_bg, card_rect, border_radius=8)
+                pygame.draw.rect(screen, card_border, card_rect, width=1, border_radius=8)
+                name_s = font.render(col.name, True, text_color)
+                screen.blit(name_s, (card_rect.x + 10, card_rect.y + 8))
+                inner = pygame.Rect(card_rect.x + 8, card_rect.y + 30, card_rect.w - 16, CARD_HEIGHT - 38)
+                third = (inner.w - 16) // 3
+                f_s = pygame.Rect(inner.x, inner.y + 18, third, 26)
+                f_f = pygame.Rect(f_s.right + 8, inner.y + 18, third, 26)
+                f_r = pygame.Rect(f_f.right + 8, inner.y + 18, third, 26)
+                fs = focused_field == (i, "soldiers")
+                ff = focused_field == (i, "fetchers")
+                frf = focused_field == (i, "respawn")
+                draw_text_field(screen, f_s, col.soldiers_str, "Soldiers", fs)
+                draw_text_field(screen, f_f, col.fetchers_str, "Fetchers", ff)
+                draw_text_field(screen, f_r, col.respawn_str, "Respawn", frf)
+                rew_y = inner.y + 18 + 26 + 10
+                rew_prev = pygame.Rect(inner.x, rew_y, 28, 24)
+                rew_next = pygame.Rect(inner.right - 28, rew_y, 28, 24)
+                draw_button(screen, rew_prev, "<", rew_prev.collidepoint(mx, my), False)
+                draw_button(screen, rew_next, ">", rew_next.collidepoint(mx, my), False)
+                rw_txt = font_small.render(col.reward, True, muted)
+                rw_rect = rw_txt.get_rect(center=((rew_prev.right + rew_next.left) // 2, rew_y + 12))
+                screen.blit(rw_txt, rw_rect)
+                lab = font_small.render("Reward", True, muted)
+                screen.blit(lab, (inner.x, rew_y - 14))
 
-        if not colonies:
-            empty = font_small.render("No colonies", True, muted)
-            screen.blit(empty, (scroll_rect.x + 8, scroll_rect.y + 6))
+            if not colonies:
+                empty = font_small.render("No colonies", True, muted)
+                screen.blit(empty, (scroll_rect.x + 8, scroll_rect.y + 6))
 
         screen.set_clip(old_clip)
-        if content_h > scroll_rect.height:
+        if not edit_map and content_h > scroll_rect.height:
             bar_h = max(20, int(scroll_rect.height * scroll_rect.height / content_h))
             max_scroll = content_h - scroll_rect.height
             t = colony_scroll / max_scroll if max_scroll > 0 else 0.0
@@ -390,6 +795,7 @@ def run_window() -> int:
 
         pygame.display.flip()
         clock.tick(60)
+    save_terrain()
     pygame.quit()
     return 0
 
