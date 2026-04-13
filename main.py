@@ -3,6 +3,7 @@ import io
 import json
 import math
 import os
+import random
 import struct
 import sys
 from dataclasses import dataclass
@@ -11,8 +12,8 @@ from pathlib import Path
 from ants.world import Viewport, World
 
 # World size in abstract units (shown as a letterboxed rectangle on screen).
-WORLD_WIDTH = 2800.0
-WORLD_HEIGHT = 2400.0
+WORLD_WIDTH = 5600.0
+WORLD_HEIGHT = 4800.0
 WINDOW_WIDTH = 1500
 WINDOW_HEIGHT = 800
 PANEL_WIDTH = 500
@@ -29,6 +30,14 @@ BRUSH_PRESET_ROW_H = 42
 BRUSH_PRESET_GAP = 6
 BRUSH_PRESET_MAX = max(BRUSH_RADIUS_PRESETS)
 BRUSH_PREVIEW_WHITE = (255, 255, 255)
+BRUSH_PREVIEW_FAINT = (200, 210, 230)
+FOOD_SPAWN_INTERVAL_MS = 72
+FOOD_GROW_PER_MS = 0.028
+FOOD_R_MAX_FRAC = 0.1
+FOOD_ERASE_SEARCH_RADIUS_PX = 88
+FOOD_SPEED_COUNT = 5
+FOOD_CURSOR_PREVIEW_MAX_PX = 20
+_ASSET_DIR = Path(__file__).resolve().parent / "asset"
 _SAVE_DIR = Path(__file__).resolve().parent / "save"
 # Raw RGB grid: magic "CMP1", uint32 LE width, uint32 LE height, then w*h*3 bytes row-major RGB.
 TERRAIN_BIN_MAGIC = b"CMP1"
@@ -36,7 +45,8 @@ _TERRAIN_HEADER = struct.Struct("<4sII")
 TERRAIN_SAVE_FILE = _SAVE_DIR / "terrain.bin"
 _LEGACY_TERRAIN_FILE = Path(__file__).resolve().parent / "terrain_map.png"
 SESSION_SAVE_FILE = _SAVE_DIR / "session.json"
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+_SESSION_VERSION_LEGACY = 1
 
 
 def _terrain_tmp_path(path: Path) -> Path:
@@ -171,7 +181,10 @@ def _session_read() -> dict | None:
         d = json.loads(SESSION_SAVE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError, TypeError):
         return None
-    if not isinstance(d, dict) or d.get("version") != SESSION_VERSION:
+    if not isinstance(d, dict):
+        return None
+    ver = d.get("version")
+    if ver not in (SESSION_VERSION, _SESSION_VERSION_LEGACY):
         return None
     return d
 
@@ -182,6 +195,9 @@ def _session_write(
     colony_scroll: int,
     brush_radius_index: int,
     sim_running: bool,
+    foods: list[tuple[float, float]],
+    edit_tool: str,
+    food_speed_index: int,
 ) -> None:
     tmp = SESSION_SAVE_FILE.with_suffix(".tmp.json")
     payload = {
@@ -191,6 +207,9 @@ def _session_write(
         "colony_scroll": colony_scroll,
         "brush_radius_index": brush_radius_index,
         "sim_running": sim_running,
+        "foods": [{"x": fx, "y": fy} for fx, fy in foods],
+        "edit_tool": edit_tool if edit_tool in ("terrain", "food") else "terrain",
+        "food_speed_index": food_speed_index,
     }
     try:
         _SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,6 +274,34 @@ def run_window() -> int:
     pygame.display.set_caption("Ant colony sim")
     clock = pygame.time.Clock()
     font, font_small, font_title = _make_ui_fonts()
+    food_sprite_path = _ASSET_DIR / "ant-food.png"
+    food_cursor_sprite = None
+    food_sprite = None
+    try:
+        _raw_food = pygame.image.load(str(food_sprite_path.resolve()))
+        try:
+            food_sprite = _raw_food.convert_alpha()
+        except (pygame.error, TypeError, ValueError):
+            food_sprite = _raw_food.convert()
+        iw, ih = food_sprite.get_size()
+        if iw > 0 and ih > 0:
+            hw = max(1, int(round(iw * 0.5)))
+            hh = max(1, int(round(ih * 0.5)))
+            if (hw, hh) != (iw, ih):
+                food_sprite = pygame.transform.smoothscale(food_sprite, (hw, hh))
+            cw, ch = food_sprite.get_size()
+            cap = FOOD_CURSOR_PREVIEW_MAX_PX
+            cscale = min(cap / cw, cap / ch, 1.0)
+            nw = max(1, int(round(cw * cscale)))
+            nh = max(1, int(round(ch * cscale)))
+            food_cursor_sprite = (
+                pygame.transform.smoothscale(food_sprite, (nw, nh))
+                if (nw, nh) != (cw, ch)
+                else food_sprite
+            )
+    except (pygame.error, OSError, TypeError, ValueError):
+        food_sprite = None
+        food_cursor_sprite = None
 
     map_rx, map_ry, map_rw, map_rh = viewport.world_rect_screen()
     terrain_surf = pygame.Surface((map_rw, map_rh))
@@ -267,41 +314,13 @@ def run_window() -> int:
     _ed_w = max(0, map_rw - 2 * BORDER_LOCK)
     _ed_h = max(0, map_rh - 2 * BORDER_LOCK)
     editable_inner = pygame.Rect(BORDER_LOCK, BORDER_LOCK, _ed_w, _ed_h)
+    food_r_max_px = max(8.0, min(map_rw, map_rh) * FOOD_R_MAX_FRAC)
 
     def _in_editable(lx: float, ly: float) -> bool:
         return (
             editable_inner.left <= lx < editable_inner.right
             and editable_inner.top <= ly < editable_inner.bottom
         )
-
-    def stamp_brush(lx: float, ly: float, radius: int, color: tuple[int, int, int]) -> None:
-        if radius < 1 or not _in_editable(lx, ly):
-            return
-        old = terrain_surf.get_clip()
-        terrain_surf.set_clip(editable_inner)
-        pygame.draw.circle(terrain_surf, color, (int(lx), int(ly)), int(radius))
-        terrain_surf.set_clip(old)
-
-    def paint_brush_line(
-        x0: float,
-        y0: float,
-        x1: float,
-        y1: float,
-        radius: int,
-        color: tuple[int, int, int],
-        *,
-        step_frac: float = 0.5,
-    ) -> None:
-        dx, dy = x1 - x0, y1 - y0
-        dist = math.hypot(dx, dy)
-        if dist < 0.5:
-            stamp_brush(x1, y1, radius, color)
-            return
-        step = max(1.0, radius * step_frac)
-        n = max(1, int(math.ceil(dist / step)))
-        for i in range(n + 1):
-            t = i / n
-            stamp_brush(x0 + dx * t, y0 + dy * t, radius, color)
 
     border_color = (120, 140, 160)
     panel_bg = (24, 28, 38)
@@ -317,14 +336,22 @@ def run_window() -> int:
     field_focus = (120, 150, 210)
 
     colonies: list[ColonyRow] = default_colonies()
+    foods: list[tuple[float, float]] = []
     sim_running = False
     edit_map = False
-    brush_tool_active = True
+    edit_tool = "terrain"
     brush_dropdown_open = False
+    food_speed_dropdown_open = False
     brush_radius_index = 2
     brush_radius_px = BRUSH_RADIUS_PRESETS[brush_radius_index]
+    food_speed_index = 2
     last_stroke_left: tuple[float, float] | None = None
     last_stroke_right: tuple[float, float] | None = None
+    food_press_ms = 0
+    last_food_spawn_ms = 0
+    last_food_erase_ms = 0
+    food_lmb_active = False
+    food_rmb_active = False
     colony_scroll = 0
     next_custom_id = 1
     # (colony_index, "soldiers"|"fetchers"|"respawn") | None
@@ -420,7 +447,130 @@ def run_window() -> int:
                 pass
         if "sim_running" in sd:
             sim_running = bool(sd["sim_running"])
+        raw_foods = sd.get("foods")
+        if isinstance(raw_foods, list):
+            loaded: list[tuple[float, float]] = []
+            for it in raw_foods:
+                if not isinstance(it, dict):
+                    continue
+                try:
+                    fx = float(it.get("x", 0.0))
+                    fy = float(it.get("y", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                fx = min(max(0.0, fx), WORLD_WIDTH)
+                fy = min(max(0.0, fy), WORLD_HEIGHT)
+                loaded.append((fx, fy))
+            if loaded:
+                foods = loaded
+        et = sd.get("edit_tool")
+        if et == "food" or et == "terrain":
+            edit_tool = et
+        if "food_speed_index" in sd:
+            try:
+                fsi = int(sd["food_speed_index"])
+                if 0 <= fsi < FOOD_SPEED_COUNT:
+                    food_speed_index = fsi
+            except (TypeError, ValueError):
+                pass
     clamp_scroll()
+
+    def is_tunnel_at_map_pixel(lx: float, ly: float) -> bool:
+        if not (0.0 <= lx < map_rw and 0.0 <= ly < map_rh):
+            return False
+        ix = int(min(map_rw - 1, max(0, lx)))
+        iy = int(min(map_rh - 1, max(0, ly)))
+        try:
+            c = terrain_surf.get_at((ix, iy))
+            rgb = (int(c[0]), int(c[1]), int(c[2]))
+        except (ValueError, pygame.error, IndexError, TypeError):
+            return False
+        if rgb == TERRAIN_TUNNEL:
+            return True
+        tw = sum((rgb[i] - TERRAIN_TUNNEL[i]) ** 2 for i in range(3))
+        ww = sum((rgb[i] - TERRAIN_WALL[i]) ** 2 for i in range(3))
+        return tw < ww
+
+    def is_tunnel_at_world(wx: float, wy: float) -> bool:
+        lx = wx / WORLD_WIDTH * map_rw
+        ly = wy / WORLD_HEIGHT * map_rh
+        return is_tunnel_at_map_pixel(lx, ly)
+
+    def map_pixel_to_world(lx: float, ly: float) -> tuple[float, float]:
+        return (lx / map_rw * WORLD_WIDTH, ly / map_rh * WORLD_HEIGHT)
+
+    def food_spawn_burst(lx_center: float, ly_center: float, elapsed_ms: int) -> None:
+        nonlocal foods
+        R = min(food_r_max_px, FOOD_GROW_PER_MS * max(0, elapsed_ms))
+        R = max(2.0, R)
+        k = food_speed_index + 1
+        for hi in range(k):
+            if hi == 0 and is_tunnel_at_map_pixel(lx_center, ly_center):
+                foods.append(map_pixel_to_world(lx_center, ly_center))
+                continue
+            for _attempt in range(32):
+                u = random.random() * 2 * math.pi
+                v = random.random()
+                rr = math.sqrt(v) * R
+                clx = lx_center + math.cos(u) * rr
+                cly = ly_center + math.sin(u) * rr
+                if not (0.0 <= clx < map_rw and 0.0 <= cly < map_rh):
+                    continue
+                if is_tunnel_at_map_pixel(clx, cly):
+                    foods.append(map_pixel_to_world(clx, cly))
+                    break
+
+    def cull_food_not_on_tunnel() -> None:
+        nonlocal foods
+        foods[:] = [f for f in foods if is_tunnel_at_world(f[0], f[1])]
+
+    def erase_foods_by_proximity(lx_map: float, ly_map: float) -> None:
+        nonlocal foods
+        k = food_speed_index + 1
+        r_lim = FOOD_ERASE_SEARCH_RADIUS_PX
+        scored: list[tuple[float, int]] = []
+        for i, f in enumerate(foods):
+            flx = f[0] / WORLD_WIDTH * map_rw
+            fly = f[1] / WORLD_HEIGHT * map_rh
+            d = math.hypot(flx - lx_map, fly - ly_map)
+            if d <= r_lim:
+                scored.append((d, i))
+        scored.sort(key=lambda t: t[0])
+        drop = {scored[j][1] for j in range(min(k, len(scored)))}
+        if not drop:
+            return
+        foods[:] = [f for i, f in enumerate(foods) if i not in drop]
+
+    def stamp_brush(lx: float, ly: float, radius: int, color: tuple[int, int, int]) -> None:
+        if radius < 1 or not _in_editable(lx, ly):
+            return
+        old = terrain_surf.get_clip()
+        terrain_surf.set_clip(editable_inner)
+        pygame.draw.circle(terrain_surf, color, (int(lx), int(ly)), int(radius))
+        terrain_surf.set_clip(old)
+        if color == TERRAIN_WALL:
+            cull_food_not_on_tunnel()
+
+    def paint_brush_line(
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        radius: int,
+        color: tuple[int, int, int],
+        *,
+        step_frac: float = 0.5,
+    ) -> None:
+        dx, dy = x1 - x0, y1 - y0
+        dist = math.hypot(dx, dy)
+        if dist < 0.5:
+            stamp_brush(x1, y1, radius, color)
+            return
+        step = max(1.0, radius * step_frac)
+        n = max(1, int(math.ceil(dist / step)))
+        for i in range(n + 1):
+            t = i / n
+            stamp_brush(x0 + dx * t, y0 + dy * t, radius, color)
 
     def save_terrain() -> None:
         tmp = _terrain_tmp_path(TERRAIN_SAVE_FILE)
@@ -438,23 +588,55 @@ def run_window() -> int:
             colony_scroll,
             brush_radius_index,
             sim_running,
+            foods,
+            edit_tool,
+            food_speed_index,
         )
 
-    def edit_layout() -> tuple[pygame.Rect, pygame.Rect, pygame.Rect, list[pygame.Rect]]:
+    def edit_layout() -> tuple[
+        pygame.Rect,
+        pygame.Rect,
+        pygame.Rect,
+        list[pygame.Rect],
+        pygame.Rect,
+        pygame.Rect,
+        list[pygame.Rect],
+    ]:
         done_r = pygame.Rect(PANEL_MARGIN, edit_done_y, PANEL_WIDTH - 2 * PANEL_MARGIN, btn_h)
         half_w = (PANEL_WIDTH - 3 * PANEL_MARGIN) // 2
-        brush_tool_r = pygame.Rect(PANEL_MARGIN, edit_brush_y, half_w, btn_h)
-        drop_head_r = pygame.Rect(brush_tool_r.right + PANEL_MARGIN, edit_brush_y, half_w, btn_h)
-        opt_rects: list[pygame.Rect] = []
+        inner_w = PANEL_WIDTH - 2 * PANEL_MARGIN
+        y = edit_brush_y
+        terrain_tool_r = pygame.Rect(PANEL_MARGIN, y, half_w, btn_h)
+        terrain_drop_r = pygame.Rect(terrain_tool_r.right + PANEL_MARGIN, y, half_w, btn_h)
+        y += btn_h + 4
+        terrain_opt_rects: list[pygame.Rect] = []
         if brush_dropdown_open:
             n = len(BRUSH_RADIUS_PRESETS)
-            inner_w = PANEL_WIDTH - 2 * PANEL_MARGIN
             cell_w = max(1, (inner_w - BRUSH_PRESET_GAP * (n - 1)) // n)
-            top = drop_head_r.bottom + 4
             for i in range(n):
                 x = PANEL_MARGIN + i * (cell_w + BRUSH_PRESET_GAP)
-                opt_rects.append(pygame.Rect(x, top, cell_w, BRUSH_PRESET_ROW_H - 2))
-        return done_r, brush_tool_r, drop_head_r, opt_rects
+                terrain_opt_rects.append(pygame.Rect(x, y, cell_w, BRUSH_PRESET_ROW_H - 2))
+            y += BRUSH_PRESET_ROW_H + 4
+        y += 6
+        food_tool_r = pygame.Rect(PANEL_MARGIN, y, half_w, btn_h)
+        food_drop_r = pygame.Rect(food_tool_r.right + PANEL_MARGIN, y, half_w, btn_h)
+        y += btn_h + 4
+        food_opt_rects: list[pygame.Rect] = []
+        if food_speed_dropdown_open:
+            n_sp = FOOD_SPEED_COUNT
+            cell_w_f = max(1, (inner_w - BRUSH_PRESET_GAP * (n_sp - 1)) // n_sp)
+            for i in range(n_sp):
+                x = PANEL_MARGIN + i * (cell_w_f + BRUSH_PRESET_GAP)
+                food_opt_rects.append(pygame.Rect(x, y, cell_w_f, BRUSH_PRESET_ROW_H - 2))
+        return (
+            done_r,
+            terrain_tool_r,
+            terrain_drop_r,
+            terrain_opt_rects,
+            food_tool_r,
+            food_drop_r,
+            food_opt_rects,
+        )
 
     def preset_circle_radius(preset_r: int, cell_w: int, cell_h: int) -> int:
         cap = min(cell_w, cell_h) // 2 - 3
@@ -466,7 +648,6 @@ def run_window() -> int:
     running = True
     mouse_xy = (0, 0)
     while running:
-        mx, my = mouse_xy
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 save_terrain()
@@ -480,7 +661,7 @@ def run_window() -> int:
                 pressed = pygame.mouse.get_pressed(3)
                 if (
                     edit_map
-                    and brush_tool_active
+                    and edit_tool == "terrain"
                     and ex < panel_x
                     and map_screen_rect.collidepoint(ex, ey)
                 ):
@@ -514,10 +695,13 @@ def run_window() -> int:
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     last_stroke_left = None
+                    food_lmb_active = False
                 elif event.button == 3:
                     last_stroke_right = None
+                    food_rmb_active = False
             elif event.type == pygame.MOUSEWHEEL:
-                if not edit_map and scroll_rect.collidepoint(mx, my):
+                whx, why = pygame.mouse.get_pos()
+                if not edit_map and scroll_rect.collidepoint(whx, why):
                     colony_scroll -= event.y * 28
                     clamp_scroll()
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -528,33 +712,62 @@ def run_window() -> int:
                     focused_field = None
                     if edit_map and map_screen_rect.collidepoint(px, py):
                         brush_dropdown_open = False
-                        if brush_tool_active and event.button in (1, 3):
-                            lx_f = px - map_rx
-                            ly_f = py - map_ry
-                            if _in_editable(lx_f, ly_f):
+                        food_speed_dropdown_open = False
+                        lx_f = px - map_rx
+                        ly_f = py - map_ry
+                        if _in_editable(lx_f, ly_f):
+                            if edit_tool == "terrain" and event.button in (1, 3):
                                 if event.button == 1:
                                     stamp_brush(lx_f, ly_f, brush_radius_px, TERRAIN_TUNNEL)
                                     last_stroke_left = (lx_f, ly_f)
                                 else:
                                     stamp_brush(lx_f, ly_f, brush_radius_px, TERRAIN_WALL)
                                     last_stroke_right = (lx_f, ly_f)
+                            elif edit_tool == "food" and event.button == 1:
+                                food_lmb_active = True
+                                food_press_ms = pygame.time.get_ticks()
+                                food_spawn_burst(lx_f, ly_f, 0)
+                                last_food_spawn_ms = food_press_ms
+                            elif edit_tool == "food" and event.button == 3:
+                                food_rmb_active = True
+                                erase_foods_by_proximity(lx_f, ly_f)
+                                last_food_erase_ms = pygame.time.get_ticks()
                     continue
 
                 focused_field = None
                 if edit_map:
-                    done_r, brush_tool_r, drop_head_r, opt_rects = edit_layout()
+                    (
+                        done_r,
+                        terrain_tool_r,
+                        terrain_drop_r,
+                        terrain_opt_rects,
+                        food_tool_r,
+                        food_drop_r,
+                        food_opt_rects,
+                    ) = edit_layout()
                     if event.button == 1:
                         if done_r.collidepoint(plx, ply):
                             edit_map = False
                             brush_dropdown_open = False
+                            food_speed_dropdown_open = False
                             save_terrain()
-                        elif brush_tool_r.collidepoint(plx, ply):
-                            brush_tool_active = not brush_tool_active
-                        elif drop_head_r.collidepoint(plx, ply):
+                        elif terrain_tool_r.collidepoint(plx, ply):
+                            edit_tool = "terrain"
+                            food_lmb_active = False
+                            food_rmb_active = False
+                        elif food_tool_r.collidepoint(plx, ply):
+                            edit_tool = "food"
+                            food_lmb_active = False
+                            food_rmb_active = False
+                        elif terrain_drop_r.collidepoint(plx, ply):
                             brush_dropdown_open = not brush_dropdown_open
+                            food_speed_dropdown_open = False
+                        elif food_drop_r.collidepoint(plx, ply):
+                            food_speed_dropdown_open = not food_speed_dropdown_open
+                            brush_dropdown_open = False
                         elif brush_dropdown_open:
                             picked = False
-                            for i, orr in enumerate(opt_rects):
+                            for i, orr in enumerate(terrain_opt_rects):
                                 if orr.collidepoint(plx, ply):
                                     brush_radius_index = i
                                     brush_radius_px = BRUSH_RADIUS_PRESETS[i]
@@ -563,6 +776,16 @@ def run_window() -> int:
                                     break
                             if not picked:
                                 brush_dropdown_open = False
+                        elif food_speed_dropdown_open:
+                            picked_f = False
+                            for i, orr in enumerate(food_opt_rects):
+                                if orr.collidepoint(plx, ply):
+                                    food_speed_index = i
+                                    food_speed_dropdown_open = False
+                                    picked_f = True
+                                    break
+                            if not picked_f:
+                                food_speed_dropdown_open = False
                     continue
 
                 if event.button != 1:
@@ -664,6 +887,25 @@ def run_window() -> int:
                 else:
                     c.respawn_str = buf
 
+        mx, my = pygame.mouse.get_pos()
+        mouse_xy = (mx, my)
+
+        if edit_map and edit_tool == "food" and mx < panel_x and map_screen_rect.collidepoint(mx, my):
+            lx_loop = mx - map_rx
+            ly_loop = my - map_ry
+            if _in_editable(lx_loop, ly_loop):
+                pressed_loop = pygame.mouse.get_pressed(3)
+                now_loop = pygame.time.get_ticks()
+                if pressed_loop[0] and food_lmb_active:
+                    if now_loop - last_food_spawn_ms >= FOOD_SPAWN_INTERVAL_MS:
+                        last_food_spawn_ms = now_loop
+                        elapsed = max(0, now_loop - food_press_ms)
+                        food_spawn_burst(lx_loop, ly_loop, elapsed)
+                if pressed_loop[2] and food_rmb_active:
+                    if now_loop - last_food_erase_ms >= FOOD_SPAWN_INTERVAL_MS:
+                        last_food_erase_ms = now_loop
+                        erase_foods_by_proximity(lx_loop, ly_loop)
+
         screen.fill((20, 24, 32))
         rx, ry, rw, rh = map_rx, map_ry, map_rw, map_rh
         screen.blit(terrain_surf, (rx, ry))
@@ -676,8 +918,49 @@ def run_window() -> int:
             paused_txt = font_title.render("Paused", True, text_color)
             screen.blit(paused_txt, paused_txt.get_rect(center=(rx + rw // 2, ry + rh // 2)))
 
-        if edit_map and brush_tool_active and map_screen_rect.collidepoint(mx, my):
-            pygame.draw.circle(screen, BRUSH_PREVIEW_WHITE, (mx, my), brush_radius_px, width=2)
+        for fwx, fwy in foods:
+            flx = fwx / WORLD_WIDTH * map_rw
+            fly = fwy / WORLD_HEIGHT * map_rh
+            fsx = int(map_rx + flx)
+            fsy = int(map_ry + fly)
+            if food_sprite is not None:
+                fr = food_sprite.get_rect(center=(fsx, fsy))
+                screen.blit(food_sprite, fr)
+            else:
+                pygame.draw.circle(screen, (72, 180, 96), (fsx, fsy), 2)
+
+        if edit_map and map_screen_rect.collidepoint(mx, my):
+            if edit_tool == "terrain":
+                pygame.draw.circle(screen, BRUSH_PREVIEW_WHITE, (mx, my), brush_radius_px, width=2)
+            elif edit_tool == "food" and food_cursor_sprite is not None:
+                crect = food_cursor_sprite.get_rect(center=(mx, my))
+                screen.blit(food_cursor_sprite, crect)
+            if (
+                edit_tool == "food"
+                and food_lmb_active
+                and pygame.mouse.get_pressed(3)[0]
+                and mx < panel_x
+                and _in_editable(mx - map_rx, my - map_ry)
+            ):
+                now_pv = pygame.time.get_ticks()
+                elapsed_pv = max(0, now_pv - food_press_ms)
+                Rpv = min(food_r_max_px, FOOD_GROW_PER_MS * elapsed_pv)
+                Rpv = max(2.0, Rpv)
+                pygame.draw.circle(screen, BRUSH_PREVIEW_FAINT, (mx, my), int(Rpv), width=1)
+            if (
+                edit_tool == "food"
+                and food_rmb_active
+                and pygame.mouse.get_pressed(3)[2]
+                and mx < panel_x
+                and _in_editable(mx - map_rx, my - map_ry)
+            ):
+                pygame.draw.circle(
+                    screen,
+                    BRUSH_PREVIEW_FAINT,
+                    (mx, my),
+                    FOOD_ERASE_SEARCH_RADIUS_PX,
+                    width=1,
+                )
 
         pygame.draw.line(screen, panel_border, (panel_x, 0), (panel_x, WINDOW_HEIGHT), width=1)
         panel_surf = screen.subsurface(pygame.Rect(panel_x, 0, PANEL_WIDTH, WINDOW_HEIGHT))
@@ -687,43 +970,84 @@ def run_window() -> int:
         if edit_map:
             title = font_title.render("Edit map", True, text_color)
             panel_surf.blit(title, (PANEL_MARGIN, 12))
-            done_r, brush_tool_r, drop_head_r, opt_rects = edit_layout()
+            (
+                done_r,
+                terrain_tool_r,
+                terrain_drop_r,
+                terrain_opt_rects,
+                food_tool_r,
+                food_drop_r,
+                food_opt_rects,
+            ) = edit_layout()
             draw_button(panel_surf, done_r, "Done", done_r.collidepoint(plx, ply), False)
             draw_button(
                 panel_surf,
-                brush_tool_r,
+                terrain_tool_r,
                 "Brush",
-                brush_tool_r.collidepoint(plx, ply),
-                brush_tool_active,
+                terrain_tool_r.collidepoint(plx, ply),
+                edit_tool == "terrain",
             )
-            pygame.draw.rect(panel_surf, field_bg, drop_head_r, border_radius=6)
+            pygame.draw.rect(panel_surf, field_bg, terrain_drop_r, border_radius=6)
             pygame.draw.rect(
                 panel_surf,
                 panel_border,
-                drop_head_r,
+                terrain_drop_r,
                 width=2 if brush_dropdown_open else 1,
                 border_radius=6,
             )
-            head_dr = preset_circle_radius(brush_radius_px, drop_head_r.w - 28, drop_head_r.h)
-            head_cx = drop_head_r.left + 12 + head_dr
-            head_cy = drop_head_r.centery
-            pygame.draw.circle(panel_surf, text_color, (head_cx, head_cy), head_dr)
-            cx = drop_head_r.right - 14
-            cy = drop_head_r.centery
-            s = 5
+            t_head_dr = preset_circle_radius(brush_radius_px, terrain_drop_r.w - 28, terrain_drop_r.h)
+            t_head_cx = terrain_drop_r.left + 12 + t_head_dr
+            t_head_cy = terrain_drop_r.centery
+            pygame.draw.circle(panel_surf, text_color, (t_head_cx, t_head_cy), t_head_dr)
+            tcx = terrain_drop_r.right - 14
+            tcy = terrain_drop_r.centery
+            ts = 5
             if brush_dropdown_open:
-                tri = [(cx - s, cy + s // 2), (cx + s, cy + s // 2), (cx, cy - s // 2)]
+                ttri = [(tcx - ts, tcy + ts // 2), (tcx + ts, tcy + ts // 2), (tcx, tcy - ts // 2)]
             else:
-                tri = [(cx - s, cy - s // 2), (cx + s, cy - s // 2), (cx, cy + s // 2)]
-            pygame.draw.polygon(panel_surf, muted, tri)
+                ttri = [(tcx - ts, tcy - ts // 2), (tcx + ts, tcy - ts // 2), (tcx, tcy + ts // 2)]
+            pygame.draw.polygon(panel_surf, muted, ttri)
             if brush_dropdown_open:
-                for i, orr in enumerate(opt_rects):
+                for i, orr in enumerate(terrain_opt_rects):
                     pr = BRUSH_RADIUS_PRESETS[i]
                     pygame.draw.rect(panel_surf, card_bg, orr, border_radius=4)
                     bcol = btn_active if i == brush_radius_index else card_border
                     pygame.draw.rect(panel_surf, bcol, orr, width=2 if i == brush_radius_index else 1, border_radius=4)
                     show_r = preset_circle_radius(pr, orr.w, orr.h)
                     pygame.draw.circle(panel_surf, text_color, orr.center, show_r)
+
+            draw_button(
+                panel_surf,
+                food_tool_r,
+                "Food",
+                food_tool_r.collidepoint(plx, ply),
+                edit_tool == "food",
+            )
+            pygame.draw.rect(panel_surf, field_bg, food_drop_r, border_radius=6)
+            pygame.draw.rect(
+                panel_surf,
+                panel_border,
+                food_drop_r,
+                width=2 if food_speed_dropdown_open else 1,
+                border_radius=6,
+            )
+            spd_txt = font_title.render(str(food_speed_index + 1), True, text_color)
+            panel_surf.blit(spd_txt, spd_txt.get_rect(center=(food_drop_r.left + 24, food_drop_r.centery)))
+            fcx = food_drop_r.right - 14
+            fcy = food_drop_r.centery
+            fs = 5
+            if food_speed_dropdown_open:
+                ftri = [(fcx - fs, fcy + fs // 2), (fcx + fs, fcy + fs // 2), (fcx, fcy - fs // 2)]
+            else:
+                ftri = [(fcx - fs, fcy - fs // 2), (fcx + fs, fcy - fs // 2), (fcx, fcy + fs // 2)]
+            pygame.draw.polygon(panel_surf, muted, ftri)
+            if food_speed_dropdown_open:
+                for i, orr in enumerate(food_opt_rects):
+                    pygame.draw.rect(panel_surf, card_bg, orr, border_radius=4)
+                    bcf = btn_active if i == food_speed_index else card_border
+                    pygame.draw.rect(panel_surf, bcf, orr, width=2 if i == food_speed_index else 1, border_radius=4)
+                    dig = font.render(str(i + 1), True, text_color)
+                    panel_surf.blit(dig, dig.get_rect(center=orr.center))
         else:
             title = font_title.render("Simulation", True, text_color)
             panel_surf.blit(title, (PANEL_MARGIN, 12))
