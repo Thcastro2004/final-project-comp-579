@@ -124,6 +124,7 @@ def save_terrain_and_session(pygame_mod: Any, terrain_surf: Any, state: GameStat
         state.colony_scroll,
         state.brush_radius_index,
         state.sim_running,
+        state.sim_paused,
         state.foods,
         state.edit_tool,
         state.food_speed_index,

@@ -78,6 +78,8 @@ def merge_session_dict(sd: dict | None, state: GameState) -> None:
             pass
     if "sim_running" in sd:
         state.sim_running = bool(sd["sim_running"])
+    if "sim_paused" in sd:
+        state.sim_paused = bool(sd["sim_paused"])
     raw_foods = sd.get("foods")
     if isinstance(raw_foods, list):
         loaded: list[tuple[float, float]] = []
@@ -94,6 +96,8 @@ def merge_session_dict(sd: dict | None, state: GameState) -> None:
             loaded.append((fx, fy))
         if loaded:
             state.foods = loaded
+    if state.sim_running:
+        state.foods_at_run_start = list(state.foods)
     et = sd.get("edit_tool")
     if et in ("food", "terrain", "colony"):
         state.edit_tool = et

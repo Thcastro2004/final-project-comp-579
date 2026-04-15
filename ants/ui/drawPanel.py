@@ -5,6 +5,8 @@ from ants.config import (
     COLONY_COLOR_RGB,
     PANEL_MARGIN,
     PANEL_WIDTH,
+    SIM_SPEED_LABELS,
+    SIM_SPEED_PRESETS,
     WINDOW_HEIGHT,
 )
 from ants.ui.drawWidgets import (
@@ -169,10 +171,31 @@ def draw_panel_and_cards(pg: Any, bundle: RuntimeBundle, state: GameState) -> No
             p.btn_h,
         )
         row1b = pg.Rect(row1.right + PANEL_MARGIN, p.row1_y, row1.width, p.btn_h)
-        draw_button(pg, panel_surf, font, theme, row1, "Start", row1.collidepoint(plx, ply), False)
-        draw_button(pg, panel_surf, font, theme, row1b, "Pause", row1b.collidepoint(plx, ply), False)
+        left_lbl = "Reset" if state.sim_running else "Start"
+        right_lbl = "Play" if state.sim_paused else "Pause"
+        draw_button(pg, panel_surf, font, theme, row1, left_lbl, row1.collidepoint(plx, ply), False)
+        r_hover = row1b.collidepoint(plx, ply) if state.sim_running else False
+        draw_button(pg, panel_surf, font, theme, row1b, right_lbl, r_hover, False)
         edit_r = pg.Rect(PANEL_MARGIN, p.row2_y, PANEL_WIDTH - 2 * PANEL_MARGIN, p.btn_h)
         draw_button(pg, panel_surf, font, theme, edit_r, "Edit map", edit_r.collidepoint(plx, ply), False)
+
+        # Speed selector
+        spd_lbl = font_small.render("Speed", True, theme.muted)
+        panel_surf.blit(spd_lbl, (PANEL_MARGIN, p.speed_label_y))
+        n_spd = len(SIM_SPEED_PRESETS)
+        total_gap = (n_spd - 1) * 4
+        btn_w = (PANEL_WIDTH - 2 * PANEL_MARGIN - total_gap) // n_spd
+        for si, lbl in enumerate(SIM_SPEED_LABELS):
+            bx = PANEL_MARGIN + si * (btn_w + 4)
+            spd_r = pg.Rect(bx, p.speed_row_y, btn_w, p.speed_btn_h)
+            is_active = si == state.sim_speed_index
+            is_hover = spd_r.collidepoint(plx, ply)
+            bg = theme.btn_active if is_active else (theme.btn_hover if is_hover else theme.btn_idle)
+            pg.draw.rect(panel_surf, bg, spd_r, border_radius=5)
+            border_col = theme.field_focus if is_active else theme.card_border
+            pg.draw.rect(panel_surf, border_col, spd_r, width=1, border_radius=5)
+            txt = font_small.render(lbl, True, theme.text_color)
+            panel_surf.blit(txt, txt.get_rect(center=spd_r.center))
 
         cl = font.render("Colonies", True, theme.text_color)
         panel_surf.blit(cl, (PANEL_MARGIN, p.col_label_y))

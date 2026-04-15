@@ -1,2 +1,18 @@
+# ants/app.py, drawMap, input, sprites, persistence/terrain, fonts (pygame._freetype), etc.
 pygame>=2.5.0
+
+# ants/assets.py (png_surface_via_pillow, tint paths) — also pulled in by pygame.image for many formats
 pillow>=10.0.0
+
+# --- Tkinter (reward chart window: ants/ui/reward_chart_window.py) ---
+# NOT on PyPI — it is part of the Python standard library and only works if your Python binary
+# was built with Tcl/Tk (_tkinter). You cannot fix a missing tkinter with `pip install`.
+#
+# Without it, the app falls back to drawing the chart on the map (see drawMap.py).
+# macOS: Tk must be initialized before pygame/SDL (see reward_chart_window.preinit_before_pygame).
+#
+# Install Tcl/Tk for your Python, e.g.:
+#   macOS Homebrew:  brew install python-tk@3.14   # if you use `brew install python@3.14` (adds _tkinter)
+#                    brew install python-tk@3.13   # same idea for python@3.13, etc.
+#   Or: use the official installer from https://www.python.org/downloads/ (includes Tk).
+#   Debian/Ubuntu: sudo apt install python3-tk

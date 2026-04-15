@@ -10,6 +10,7 @@ from ants.assets import (
     tint_colony_sprite,
 )
 from ants.config import (
+    ANT_WALK_FRAME_SCALE,
     ASSET_DIR,
     COLONY_COLOR_RGB,
     COLONY_CURSOR_PREVIEW_MAX_PX,
@@ -65,6 +66,29 @@ class ColonyTintCache:
         return self._tinted[key]
 
 
+class AntWalkTintCache:
+    def __init__(self, pygame_mod: Any, base_frames: list[Any]) -> None:
+        self._pygame = pygame_mod
+        self._base = base_frames
+        self._tinted: dict[str, list[Any]] = {}
+
+    def frames_for_color(self, color_id: str) -> list[Any]:
+        if DEBUG_COLONY_NO_TINT:
+            return self._base
+        if color_id not in COLONY_COLOR_RGB:
+            color_id = "black"
+        if color_id not in self._tinted:
+            rgb = COLONY_COLOR_RGB[color_id]
+            out: list[Any] = []
+            for fr in self._base:
+                try:
+                    out.append(tint_colony_sprite(fr, rgb, self._pygame))
+                except Exception:
+                    out.append(fr)
+            self._tinted[color_id] = out
+        return self._tinted[color_id]
+
+
 def load_food_sprites(pygame_mod: Any) -> tuple[Any | None, Any | None]:
     food_sprite_path = ASSET_DIR / "ant-food.png"
     food_cursor_sprite = None
@@ -95,6 +119,47 @@ def load_food_sprites(pygame_mod: Any) -> tuple[Any | None, Any | None]:
         food_sprite = None
         food_cursor_sprite = None
     return food_sprite, food_cursor_sprite
+
+
+def load_ant_walk_frames(pygame_mod: Any) -> list[Any] | None:
+    folder = ASSET_DIR / "ant-walk"
+    paths = sorted(folder.glob("ant-walk-*.png"))
+    if not paths:
+        return None
+    frames: list[Any] = []
+    for p in paths:
+        raw = pygame_load_png(pygame_mod, p)
+        if raw is None:
+            continue
+        try:
+            surf = raw.convert_alpha()
+        except (pygame_mod.error, TypeError, ValueError):
+            try:
+                surf = raw.convert(32)
+            except (pygame_mod.error, TypeError, ValueError):
+                surf = raw
+        try:
+            punch_near_white_transparent(surf, pygame_mod)
+        except (pygame_mod.error, TypeError, ValueError, AttributeError, OSError):
+            pass
+        iw, ih = surf.get_size()
+        if iw > 0 and ih > 0:
+            nw = max(1, int(round(iw * ANT_WALK_FRAME_SCALE)))
+            nh = max(1, int(round(ih * ANT_WALK_FRAME_SCALE)))
+            if (nw, nh) != (iw, ih):
+                try:
+                    surf = pygame_mod.transform.smoothscale(surf, (nw, nh))
+                except (pygame_mod.error, TypeError, ValueError):
+                    pass
+        frames.append(surf)
+    return frames if frames else None
+
+
+def load_ant_walk_tint_cache(pygame_mod: Any) -> AntWalkTintCache | None:
+    frames = load_ant_walk_frames(pygame_mod)
+    if not frames:
+        return None
+    return AntWalkTintCache(pygame_mod, frames)
 
 
 def load_colony_sprites(pygame_mod: Any) -> tuple[ColonyTintCache, Any | None, Any | None]:

@@ -13,9 +13,9 @@ def _norm_reward(v: object, default: str = "individualist") -> str:
 @dataclass
 class ColonyBlueprint:
     name: str
-    soldiers_str: str = "3"
-    fetchers_str: str = "5"
-    respawn_str: str = "1.0"
+    soldiers_str: str = "0"
+    fetchers_str: str = "30"
+    respawn_str: str = "5"
     reward_soldier: str = "individualist"
     reward_fetcher: str = "individualist"
 
@@ -23,9 +23,9 @@ class ColonyBlueprint:
 @dataclass
 class SimColony:
     name: str
-    soldiers_str: str = "3"
-    fetchers_str: str = "5"
-    respawn_str: str = "1.0"
+    soldiers_str: str = "0"
+    fetchers_str: str = "30"
+    respawn_str: str = "5"
     reward_soldier: str = "individualist"
     reward_fetcher: str = "individualist"
     color_id: str = "black"
@@ -72,9 +72,9 @@ def _blueprint_from_dict(o: object) -> ColonyBlueprint | None:
     rf = _norm_reward(o.get("reward_fetcher", "individualist"))
     return ColonyBlueprint(
         name=name.strip(),
-        soldiers_str=str(o.get("soldiers_str", "3")),
-        fetchers_str=str(o.get("fetchers_str", "5")),
-        respawn_str=str(o.get("respawn_str", "1.0")),
+        soldiers_str=str(o.get("soldiers_str", "0")),
+        fetchers_str=str(o.get("fetchers_str", "30")),
+        respawn_str=str(o.get("respawn_str", "5")),
         reward_soldier=rs,
         reward_fetcher=rf,
     )
@@ -128,9 +128,9 @@ def _sim_colony_from_dict(o: object) -> SimColony | None:
         rs, rf = leg, leg
     return SimColony(
         name=name.strip(),
-        soldiers_str=str(o.get("soldiers_str", "3")),
-        fetchers_str=str(o.get("fetchers_str", "5")),
-        respawn_str=str(o.get("respawn_str", "1.0")),
+        soldiers_str=str(o.get("soldiers_str", "0")),
+        fetchers_str=str(o.get("fetchers_str", "30")),
+        respawn_str=str(o.get("respawn_str", "5")),
         reward_soldier=rs,
         reward_fetcher=rf,
         color_id=cid,
@@ -148,9 +148,9 @@ def _v2_row_from_dict(o: object) -> SimColony | None:
     rw = _norm_reward(o.get("reward"))
     return SimColony(
         name=name.strip(),
-        soldiers_str=str(o.get("soldiers_str", "3")),
-        fetchers_str=str(o.get("fetchers_str", "5")),
-        respawn_str=str(o.get("respawn_str", "1.0")),
+        soldiers_str=str(o.get("soldiers_str", "0")),
+        fetchers_str=str(o.get("fetchers_str", "30")),
+        respawn_str=str(o.get("respawn_str", "5")),
         reward_soldier=rw,
         reward_fetcher=rw,
         color_id="black",

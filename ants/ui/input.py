@@ -6,10 +6,13 @@ from ants.config import (
     CARD_GAP,
     CARD_HEIGHT,
     COLONY_COLOR_ORDER,
+    MAP_ZOOM_MAX,
+    MAP_ZOOM_MIN,
     MAX_SIM_COLONIES,
     PANEL_MARGIN,
     PANEL_WIDTH,
     REWARD_SYSTEMS,
+    SIM_SPEED_PRESETS,
     TERRAIN_TUNNEL,
     TERRAIN_WALL,
     WORLD_HEIGHT,
@@ -18,11 +21,15 @@ from ants.config import (
 from ants.models import ColonyBlueprint
 from ants.ui.helpers import (
     apply_colony_color,
+    apply_map_zoom_wheel,
+    clamp_map_pan,
     clamp_scroll,
     cycle_reward,
     food_spawn_burst,
     is_colony_ground_at_map_pixel,
     in_editable,
+    map_sim_view_active,
+    reset_map_view,
     sim_colony_from_blueprint,
 )
 from ants.ui.layout import (
@@ -32,6 +39,7 @@ from ants.ui.layout import (
     layout_new_blueprint_modal,
     sim_card_layout,
 )
+from ants.simulation import ensure_pheromone_field
 from ants.ui.map_tools import paint_brush_line, save_terrain_and_session
 from ants.ui.state import GameState, RuntimeBundle
 
@@ -62,6 +70,12 @@ def process_events(pg: Any, bundle: RuntimeBundle, state: GameState) -> None:
         elif event.type == pg.MOUSEMOTION:
             state.mouse_xy = event.pos
             ex, ey = event.pos
+            if state.map_dragging and map_sim_view_active(state):
+                relx, rely = event.rel
+                z = max(MAP_ZOOM_MIN, min(state.map_zoom, MAP_ZOOM_MAX))
+                state.map_pan_x -= relx * (p.map_rw / z) / p.map_rw
+                state.map_pan_y -= rely * (p.map_rh / z) / p.map_rh
+                clamp_map_pan(state, p)
             pressed = pg.mouse.get_pressed(3)
             if (
                 state.edit_map
@@ -106,6 +120,7 @@ def process_events(pg: Any, bundle: RuntimeBundle, state: GameState) -> None:
                         state.last_stroke_right = (lx_f, ly_f)
         elif event.type == pg.MOUSEBUTTONUP:
             if event.button == 1:
+                state.map_dragging = False
                 state.last_stroke_left = None
                 state.food_lmb_active = False
             elif event.button == 3:
@@ -120,6 +135,12 @@ def process_events(pg: Any, bundle: RuntimeBundle, state: GameState) -> None:
                     bi = min(state.add_modal_bp_index, nbp - 1)
                     state.add_modal_bp_index = min(max(0, bi - event.y), nbp - 1)
             elif (
+                not state.add_modal_open
+                and not state.new_bp_modal_open
+                and state.colony_dd is None
+            ):
+                apply_map_zoom_wheel(state, p, event.y, whx, why)
+            if (
                 not state.edit_map
                 and not state.add_modal_open
                 and not state.new_bp_modal_open
@@ -259,7 +280,14 @@ def process_events(pg: Any, bundle: RuntimeBundle, state: GameState) -> None:
 
             if px < panel_x:
                 state.focused_field = None
-                if state.edit_map and map_screen_rect.collidepoint(px, py):
+                if (
+                    map_sim_view_active(state)
+                    and map_screen_rect.collidepoint(px, py)
+                    and state.map_zoom > MAP_ZOOM_MIN + 1e-6
+                    and event.button == 1
+                ):
+                    state.map_dragging = True
+                elif state.edit_map and map_screen_rect.collidepoint(px, py):
                     state.brush_dropdown_open = False
                     state.food_speed_dropdown_open = False
                     lx_f = px - map_rx
@@ -439,13 +467,44 @@ def process_events(pg: Any, bundle: RuntimeBundle, state: GameState) -> None:
             abs_row1b = row1b.move(panel_x, 0)
             abs_edit = edit_r.move(panel_x, 0)
 
-            if abs_row1.collidepoint(px, py):
-                state.sim_running = True
-            elif abs_row1b.collidepoint(px, py):
-                state.sim_running = False
+            # Check speed selector buttons
+            n_spd = len(SIM_SPEED_PRESETS)
+            total_gap = (n_spd - 1) * 4
+            spd_btn_w = (PANEL_WIDTH - 2 * PANEL_MARGIN - total_gap) // n_spd
+            speed_clicked = False
+            for si in range(n_spd):
+                bx = panel_x + PANEL_MARGIN + si * (spd_btn_w + 4)
+                spd_r = pg.Rect(bx, p.speed_row_y, spd_btn_w, p.speed_btn_h)
+                if spd_r.collidepoint(px, py):
+                    state.sim_speed_index = si
+                    speed_clicked = True
+                    break
+
+            if speed_clicked:
+                pass
+            elif abs_row1.collidepoint(px, py):
+                if state.sim_running:
+                    state.ants.clear()
+                    state.reward_chart_series.clear()
+                    state.reward_chart_x_anchor_ms = None
+                    state.reward_chart_x_tail_mode = False
+                    state.foods = list(state.foods_at_run_start)
+                    pf = ensure_pheromone_field(state, bundle)
+                    if pf is not None:
+                        pf.reset()
+                    state.sim_running = False
+                    state.sim_paused = False
+                    reset_map_view(state)
+                else:
+                    state.foods_at_run_start = list(state.foods)
+                    state.sim_paused = False
+                    state.sim_running = True
+            elif abs_row1b.collidepoint(px, py) and state.sim_running:
+                state.sim_paused = not state.sim_paused
             elif abs_edit.collidepoint(px, py):
                 state.edit_map = True
                 state.colony_dd = None
+                reset_map_view(state)
             else:
                 add_rect = pg.Rect(
                     panel_x + PANEL_MARGIN,
